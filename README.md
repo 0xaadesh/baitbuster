@@ -17,7 +17,7 @@ BaitBuster is a premium, real-time **Phishing, Scam, and Social Engineering Chat
 
 ## 📺 Demonstration Video
 
-<video src="https://github.com/user-attachments/assets/0db654fe-4e10-44cf-b3b3-b19c805e0c8f" controls width="100%"></video>
+<video src="https://github.com/user-attachments/assets/cc12c3fc-da48-4d12-a327-efba2656ab44" controls width="100%"></video>
 
 _If the video player above does not load or play, you can [watch the demonstration video directly in your browser](https://github.com/user-attachments/assets/353c441f-5784-4d66-94ee-2cf5aa3dd9ed)._
 
