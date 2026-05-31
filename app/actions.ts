@@ -1,13 +1,31 @@
+"use server";
+
 import Groq from "groq-sdk";
 import { z } from "zod";
-import { readFileSync, mkdirSync, rmSync, readdirSync } from "fs";
+import { writeFileSync, mkdirSync, rmSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { SarvamAIClient } from "sarvamai";
 
-const groq = new Groq();
-const sarvam = new SarvamAIClient({
-  apiSubscriptionKey: process.env.SARVAM_API_KEY!,
-});
+export interface UserApiKeys {
+  groqApiKey?: string;
+  sarvamApiKey?: string;
+}
+
+function getGroqClient(apiKey?: string): Groq {
+  const key = apiKey?.trim();
+  if (!key) {
+    throw new Error("Groq API Key is not set. Please click the Settings gear icon in the header to enter your custom API key.");
+  }
+  return new Groq({ apiKey: key });
+}
+
+function getSarvamClient(apiKey?: string): SarvamAIClient {
+  const key = apiKey?.trim();
+  if (!key) {
+    throw new Error("Sarvam AI Subscription Key is not set. Please click the Settings gear icon in the header to enter your custom API key.");
+  }
+  return new SarvamAIClient({ apiSubscriptionKey: key });
+}
 
 const reasonSchema = z.object({
   title: z.string(),
@@ -25,7 +43,7 @@ const phishingAnalysisSchema = z.object({
   recommendedAction: z.string(),
 });
 
-type PhishingAnalysis = z.infer<typeof phishingAnalysisSchema>;
+export type PhishingAnalysis = z.infer<typeof phishingAnalysisSchema>;
 
 const SCHEMA_INSTRUCTIONS = `Return output strictly as valid JSON matching this exact schema:
 
@@ -65,10 +83,9 @@ const IMAGE_SYSTEM_PROMPT = `${BASE_INSTRUCTIONS}
 
 ${SCHEMA_INSTRUCTIONS}`;
 
-const landingHtml = readFileSync(join(import.meta.dir, "landing.html"), "utf-8");
-const dashboardHtml = readFileSync(join(import.meta.dir, "dashboard.html"), "utf-8");
-
-async function analyzeChat(chatText: string): Promise<PhishingAnalysis> {
+// Primary analysis helper
+async function analyzeChat(chatText: string, groqApiKey?: string): Promise<PhishingAnalysis> {
+  const groq = getGroqClient(groqApiKey);
   const response = await groq.chat.completions.create({
     model: "meta-llama/llama-4-scout-17b-16e-instruct",
     messages: [
@@ -84,7 +101,9 @@ async function analyzeChat(chatText: string): Promise<PhishingAnalysis> {
   return phishingAnalysisSchema.parse(raw);
 }
 
-async function analyzeChatImage(imageDataUrl: string): Promise<PhishingAnalysis> {
+// Multimodal image helper
+async function analyzeChatImage(imageDataUrl: string, groqApiKey?: string): Promise<PhishingAnalysis> {
+  const groq = getGroqClient(groqApiKey);
   const response = await groq.chat.completions.create({
     model: "meta-llama/llama-4-scout-17b-16e-instruct",
     messages: [
@@ -106,29 +125,35 @@ async function analyzeChatImage(imageDataUrl: string): Promise<PhishingAnalysis>
   return phishingAnalysisSchema.parse(raw);
 }
 
-interface Utterance {
+export interface Utterance {
   speaker: string;
   start: number;
   end: number;
   text: string;
 }
 
-interface TranscriptionResult {
+export interface TranscriptionResult {
   transcript: string;
   utterances: Utterance[];
   speakersDetected: number;
   languageCode: string | null;
-  raw: any;
 }
 
-async function transcribeAudio(audioBuffer: ArrayBuffer, fileName: string): Promise<TranscriptionResult> {
-  const tmpDir = join(import.meta.dir, ".tmp-audio");
-  const outDir = join(import.meta.dir, ".tmp-output");
+// Audio transcription and speaker diarization helper
+async function transcribeAudio(
+  audioBuffer: ArrayBuffer,
+  fileName: string,
+  sarvamApiKey?: string
+): Promise<TranscriptionResult> {
+  const sarvam = getSarvamClient(sarvamApiKey);
+
+  const tmpDir = join(process.cwd(), ".tmp-audio");
+  const outDir = join(process.cwd(), ".tmp-output");
   mkdirSync(tmpDir, { recursive: true });
   mkdirSync(outDir, { recursive: true });
 
   const audioPath = join(tmpDir, fileName);
-  await Bun.write(audioPath, audioBuffer);
+  writeFileSync(audioPath, Buffer.from(audioBuffer));
 
   try {
     const job = await sarvam.speechToTextJob.createJob({
@@ -159,7 +184,6 @@ async function transcribeAudio(audioBuffer: ArrayBuffer, fileName: string): Prom
 
     const out = JSON.parse(readFileSync(join(outDir, outputFiles[0]!), "utf-8"));
     console.log("Sarvam raw output keys:", Object.keys(out));
-    console.log("Sarvam raw output:", JSON.stringify(out, null, 2));
 
     const transcript: string =
       out.transcript ?? out.text
@@ -183,14 +207,14 @@ async function transcribeAudio(audioBuffer: ArrayBuffer, fileName: string): Prom
     const speakersDetected = out.num_speakers ?? out.speakers_detected ?? speakerSet.size;
     const languageCode = out.language_code ?? out.languageCode ?? out.language ?? null;
 
-    return { transcript, utterances, speakersDetected, languageCode, raw: out };
+    return { transcript, utterances, speakersDetected, languageCode };
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
     rmSync(outDir, { recursive: true, force: true });
   }
 }
 
-interface AudioAnalysisResult {
+export interface AudioAnalysisResult {
   transcript: string;
   utterances: Utterance[];
   speakersDetected: number;
@@ -198,103 +222,68 @@ interface AudioAnalysisResult {
   analysis: PhishingAnalysis;
 }
 
-async function analyzeAudio(audioBuffer: ArrayBuffer, fileName: string): Promise<AudioAnalysisResult> {
-  const stt = await transcribeAudio(audioBuffer, fileName);
-  const analysis = await analyzeChat(stt.transcript);
-  return {
-    transcript: stt.transcript,
-    utterances: stt.utterances,
-    speakersDetected: stt.speakersDetected,
-    languageCode: stt.languageCode,
-    analysis,
-  };
+// ----------------------------------------------------
+// Next.js React Server Actions
+// ----------------------------------------------------
+
+export async function analyzeChatAction(
+  chatText: string,
+  userKeys?: UserApiKeys
+): Promise<{ success: boolean; data?: PhishingAnalysis; error?: string }> {
+  try {
+    if (!chatText || !chatText.trim()) {
+      throw new Error("No chat text provided");
+    }
+    const result = await analyzeChat(chatText.trim(), userKeys?.groqApiKey);
+    return { success: true, data: result };
+  } catch (err: any) {
+    console.error("analyzeChatAction error:", err);
+    return { success: false, error: err.message || "Text analysis failed" };
+  }
 }
 
-const server = Bun.serve({
-  port: 3000,
-  async fetch(req) {
-    const url = new URL(req.url);
+export async function analyzeImageAction(
+  imageDataUrl: string,
+  userKeys?: UserApiKeys
+): Promise<{ success: boolean; data?: PhishingAnalysis; error?: string }> {
+  try {
+    if (!imageDataUrl) {
+      throw new Error("No image data provided");
+    }
+    const result = await analyzeChatImage(imageDataUrl, userKeys?.groqApiKey);
+    return { success: true, data: result };
+  } catch (err: any) {
+    console.error("analyzeImageAction error:", err);
+    return { success: false, error: err.message || "Image analysis failed" };
+  }
+}
 
-    if (url.pathname === "/back.mp4" && req.method === "GET") {
-      const file = Bun.file(join(import.meta.dir, "back.mp4"));
-      return new Response(file);
+export async function analyzeAudioAction(
+  formData: FormData,
+  userKeys?: UserApiKeys
+): Promise<{ success: boolean; data?: AudioAnalysisResult; error?: string }> {
+  try {
+    const file = formData.get("audio") as File | null;
+    if (!file) {
+      throw new Error("No audio file provided");
     }
 
-    if (url.pathname === "/" && req.method === "GET") {
-      return new Response(landingHtml, {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
-    }
+    const buffer = await file.arrayBuffer();
+    const stt = await transcribeAudio(buffer, file.name || "audio.mp3", userKeys?.sarvamApiKey);
+    const analysis = await analyzeChat(stt.transcript, userKeys?.groqApiKey);
 
-    if (url.pathname === "/dashboard" && req.method === "GET") {
-      return new Response(dashboardHtml, {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
-    }
-
-    if (url.pathname === "/analyze" && req.method === "POST") {
-      try {
-        const body = (await req.json()) as { chatText?: string };
-        const chatText = body.chatText?.trim();
-
-        if (!chatText) {
-          return Response.json({ error: "No chat text provided" }, { status: 400 });
-        }
-
-        const result = await analyzeChat(chatText);
-        return Response.json(result);
-      } catch (err: any) {
-        console.error("Analysis error:", err);
-        return Response.json(
-          { error: err.message || "Analysis failed" },
-          { status: 500 }
-        );
-      }
-    }
-
-    if (url.pathname === "/analyze-audio" && req.method === "POST") {
-      try {
-        const formData = await req.formData();
-        const file = formData.get("audio") as File | null;
-
-        if (!file) {
-          return Response.json({ error: "No audio file provided" }, { status: 400 });
-        }
-
-        const buffer = await file.arrayBuffer();
-        const result = await analyzeAudio(buffer, file.name || "audio.mp3");
-        return Response.json(result);
-      } catch (err: any) {
-        console.error("Audio analysis error:", err);
-        return Response.json(
-          { error: err.message || "Audio analysis failed" },
-          { status: 500 }
-        );
-      }
-    }
-
-    if (url.pathname === "/analyze-image" && req.method === "POST") {
-      try {
-        const body = (await req.json()) as { imageDataUrl?: string };
-        const imageDataUrl = body.imageDataUrl?.trim();
-
-        if (!imageDataUrl) {
-          return Response.json({ error: "No image provided" }, { status: 400 });
-        }
-
-        const result = await analyzeChatImage(imageDataUrl);
-        return Response.json(result);
-      } catch (err: any) {
-        console.error("Image analysis error:", err);
-        return Response.json(
-          { error: err.message || "Image analysis failed" },
-          { status: 500 }
-        );
-      }
-    }
-
-    return new Response("Not Found", { status: 404 });
-  },
-});
-
-console.log(`Cipherium running at http://localhost:${server.port}`);
+    return {
+      success: true,
+      data: {
+        transcript: stt.transcript,
+        utterances: stt.utterances,
+        speakersDetected: stt.speakersDetected,
+        languageCode: stt.languageCode,
+        analysis,
+      },
+    };
+  } catch (err: any) {
+    console.error("analyzeAudioAction error:", err);
+    return { success: false, error: err.message || "Audio analysis failed" };
+  }
+}
